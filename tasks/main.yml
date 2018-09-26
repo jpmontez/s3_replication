@@ -1,0 +1,168 @@
+---
+- name: Get the current caller identity facts
+  aws_caller_facts:
+  register: caller_facts
+
+- name: Set AWS account number
+  set_fact:
+    aws_account_number: "{{ caller_facts.account }}"
+
+- name: Create the SNS topics
+  sns_topic:
+    name: "{{ item.name}}-fanout"
+    state: present
+    region: "{{ vpc_region }}"
+  register: sns_fanout_policies
+  loop: "{{ repl_buckets }}"
+
+- name: Edit SNS topic policy for S3 fanout replication
+  sns_topic:
+    name: "{{ item.sns_topic.name }}"
+    state: present
+    region: "{{ vpc_region }}"
+    policy:
+      Statement:
+        - Effect: "Allow"
+          Principal:
+            AWS: "*"
+          Action: "SNS:Publish"
+          Resource: "{{ item.sns_arn }}"
+          Condition:
+            ArnLike:
+              AWS:SourceARN: "arn:aws:s3:::{{ item.item.name }}"
+  loop: "{{ sns_fanout_policies.results }}"
+
+# overwrite the dictionary value for the `sns_arn` key with the new SNS ARN
+# value. this is done by combining the existing dictionary with the newly
+# generated one. the result is saved as an entirely new variable for the next
+# task to manipulate further.
+- name: GET - Add SNS ARN to replication bucket facts
+  set_fact:
+    tmp_entry: "{{ item | combine(new_item) }}"
+  vars:
+    new_item: "{'sns_arn': 'arn:aws:sns:{{ vpc_region }}:{{ aws_account_number }}:{{ item.name }}-fanout' }"
+  register: tmp_entries
+  loop: "{{ repl_buckets }}"
+
+# reset the existing `repl_buckets` list of dicts with the nested attributes of
+# the newly registered variable in the previous task. this is spun out into a
+# list and registered in exactly the same format, but with the `sns_arn` value
+# filled for both source buckets.
+- name: SET - Add SNS ARN to replication bucket facts
+  set_fact:
+    repl_buckets: "{{ tmp_entries.results | map(attribute='ansible_facts.tmp_entry') | list }}"
+
+# any newly created object or version within a production bucket will send an
+# event to our previously created SNS fanout topic.
+- name: Configure the source buckets to send events to SNS fanout topic
+  s3_event:
+    bucket: "{{ item.name }}"
+    id: "{{ item.name }}-fanout"
+    state: present
+    region: "{{ vpc_region }}"
+    events:
+      - "s3:ObjectCreated:*"
+    topic_arn: "{{ item.sns_arn }}"
+  loop: "{{ repl_buckets }}"
+
+# step one of allowing our lambda functions to execute. this essentially
+# designates that whomever inherits the following role can act on behalf of the
+# lambda service.
+- name: Create IAM basic execution role
+  iam_role:
+    name: "{{ iam_role_name }}"
+    assume_role_policy_document: "{{ lookup('template','trust_policy.json.j2') }}"
+    managed_policy:
+      - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+  register: trust_policy_role
+
+- name: Set IAM basic execution role ARN fact
+  set_fact:
+    iam_role_arn: "{{ trust_policy_role.arn }}"
+
+# step two of allowing our lambda functions to execute. this policy is divided
+# into three statements. the first allows any lambda function to publish to
+# cloudwatch for logging purposes. the second allows the the lambda function to
+# only retrieve objects. the third allows only putting objects in our
+# destination buckets
+- name: Attach assets S3 replication policy document
+  iam_policy:
+    iam_name: "{{ iam_role_name }}"
+    iam_type: role
+    policy_name: "s3_repl_policy"
+    state: present
+    policy_json: "{{ lookup('template', 's3_repl_policy.json.j2') }}"
+
+- name: Remove old zip file
+  file:
+    path: "{{ lambda_zip_full_path }}"
+    state: absent
+
+- name: Create zip file
+  command: zip -r {{ lambda_zip_full_path }} .
+  args:
+    chdir: "{{ role_path }}/files/s3_replication"
+
+- name: Create Lambda functions
+  lambda:
+    name: "{{ item }}"
+    state: present
+    role: "{{ iam_role_arn }}"
+    zip_file: "{{ lambda_zip_full_path }}"
+    region: "{{ vpc_region }}"
+    runtime: "python2.7"
+    handler: "lambda_function.lambda_handler"
+  register: s3_repl_lambda_functions
+  loop: "{{ dest_bucket_names }}"
+
+# this policy allows for sns to trigger the newly created lambda functions
+- name: Create Lambda policy statements
+  lambda_policy:
+    statement_id: "{{ item.configuration.function_name }}-fanout"
+    state: present
+    action: "lambda:InvokeFunction"
+    function_name: "{{ item.configuration.function_arn }}"
+    principal: "sns.amazonaws.com"
+    region: "{{ vpc_region }}"
+  loop: "{{ s3_repl_lambda_functions.results }}"
+
+# create the sns subscription entries for each lambda endpoint.
+# the result is saved as an entirely new variable for the next
+# tasks to manipulate further.
+- name: GET - Add SNS subscription endpoints and protocols
+  set_fact:
+    tmp_entry:
+      endpoint: "{{ item.configuration.function_arn }}"
+      protocol: "lambda"
+  register: tmp_entries
+  loop: "{{ s3_repl_lambda_functions.results }}"
+
+# generate a list of subscription dicts that have an `assets` endpoint
+- name: SET - Add first bucket SNS subscription endpoints and protocols
+  set_fact:
+    first_sns_subscription_endpoints: "{{ tmp_entries.results | map(attribute='ansible_facts.tmp_entry') | selectattr('endpoint', 'match', '.*{{ repl_buckets.0.suffix }}*.') | list }}"
+
+# generate a list of subscription dicts that have an `images-web` endpoint
+- name: SET - Add second SNS subscription endpoints and protocols
+  set_fact:
+    second_sns_subscription_endpoints: "{{ tmp_entries.results | map(attribute='ansible_facts.tmp_entry') | selectattr('endpoint', 'match', '.*{{ repl_buckets.1.suffix*.') | list }}"
+
+# create the sns topic subscriptions for each unique subscription lists.
+
+- name: Create the first SNS topic subscriptions
+  sns_topic:
+    name: "{{ item.name }}-fanout"
+    subscriptions: "{{ assets_sns_subscription_endpoints }}"
+    region: "{{ vpc_region }}"
+  loop: "{{ repl_buckets }}"
+  register: first_sns_topic_sub
+  when: "'{{ repl_buckets.0.suffix }}' in item.name"
+
+- name: Create the second SNS topic subscriptions
+  sns_topic:
+    name: "{{ item.name }}-fanout"
+    subscriptions: "{{ images_web_sns_subscription_endpoints }}"
+    region: "{{ vpc_region }}"
+  loop: "{{ repl_buckets }}"
+  register: second_sns_topic_sub
+  when: "'{{ repl_buckets.1.suffix }}' in item.name"

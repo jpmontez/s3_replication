@@ -1,0 +1,11 @@
+---
+source_bucket_names: "{{ repl_buckets | map(attribute='name') | list }}"
+dest_bucket_names: "{{ repl_buckets | map(attribute='dst_buckets') | flatten }}"
+
+source_bucket_arns: "{{ source_bucket_names | format_list('arn:aws:s3:::{0}/*') }}"
+dest_bucket_arns: "{{ dest_bucket_names | format_list('arn:aws:s3:::{0}/*') }}"
+
+iam_role_name: "s3_repl_execution"
+lambda_zip_dir: "/tmp/"
+lambda_zip_name: "s3_repl_function.zip"
+lambda_zip_full_path: "{{ lambda_zip_dir }}/{{ lambda_zip_name }}"
